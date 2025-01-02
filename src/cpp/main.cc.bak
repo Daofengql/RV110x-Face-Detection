@@ -1,0 +1,443 @@
+/*-------------------------------------------
+                头文件引入
+-------------------------------------------*/
+#include <stdint.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <pthread.h>
+#include <unistd.h>
+#include <time.h>
+
+// OpenCV 头文件（嵌入式版）
+#include <opencv2/core/core.hpp>
+#include <opencv2/highgui/highgui.hpp>
+#include <opencv2/imgproc/imgproc.hpp>
+
+// YOLOv5 & 工具函数
+#include "yolov5.h"
+#include "image_utils.h"
+#include "file_utils.h"
+#include "image_drawing.h"
+#include "position_calculator.h" // 计算 pupil/iris 位置
+
+#if defined(RV1106_1103)
+    #include "dma_alloc.hpp"      // 如果要使用 DMA
+#endif
+
+/*-------------------------------------------
+    全局变量 & 同步
+-------------------------------------------*/
+pthread_mutex_t src_image_mutex = PTHREAD_MUTEX_INITIALIZER; // 用于保护 src_image
+image_buffer_t  src_image; // 全局图像，用于线程间共享
+
+/*-------------------------------------------
+    摄像头读取线程函数
+-------------------------------------------*/
+void* camera_thread_func(void* arg)
+{
+    // 打开摄像头
+    cv::VideoCapture cap;
+    cap.open(0);  
+    if (!cap.isOpened()) {
+        printf("无法打开摄像头\n");
+        // 无限等待，不退出主程序
+        while (1) { sleep(1); }
+    }
+
+    // 设置分辨率和帧率
+    cap.set(cv::CAP_PROP_FRAME_WIDTH,  320);
+    cap.set(cv::CAP_PROP_FRAME_HEIGHT, 320);
+
+    cv::Mat bgr_frame;
+    while (1)
+    {
+        // 从摄像头读一帧 (BGR)
+        cap >> bgr_frame;
+        if (bgr_frame.empty()) {
+            printf("读取摄像头帧失败或空帧！\n");
+            usleep(10 * 1000);
+            continue;
+        }
+
+        // 转换为RGB格式（假设 YOLOv5 或后续流程需要 RGB888）
+        cv::Mat rgb_frame;
+        cv::cvtColor(bgr_frame, rgb_frame, cv::COLOR_BGR2RGB);
+
+        // 分配并填充临时 image_buffer_t
+        image_buffer_t temp_image;
+        memset(&temp_image, 0, sizeof(temp_image));
+
+        temp_image.width  = rgb_frame.cols;
+        temp_image.height = rgb_frame.rows;
+        temp_image.format = IMAGE_FORMAT_RGB888; 
+        temp_image.size   = rgb_frame.total() * rgb_frame.elemSize(); // cols * rows * channels
+        
+    #if defined(RV1106_1103)
+        // 如果是RV1106/1103平台，需要 DMA 分配
+        int ret_dma = dma_buf_alloc(
+            RV1106_CMA_HEAP_PATH,
+            temp_image.size,
+            &temp_image.fd,
+            (void**)&temp_image.virt_addr
+        );
+        if (ret_dma != 0) {
+            printf("DMA缓冲区分配失败！ret_dma=%d\n", ret_dma);
+            continue;
+        }
+        // 将rgb_frame的数据拷入 DMA 缓冲区
+        memcpy(temp_image.virt_addr, rgb_frame.data, temp_image.size);
+        // 同步到设备
+        dma_sync_cpu_to_device(temp_image.fd);
+    #else
+        // 如果不是RV1106/1103平台，就普通 malloc
+        temp_image.virt_addr = (unsigned char*)malloc(temp_image.size);
+        if (!temp_image.virt_addr) {
+            printf("malloc失败，内存不足？\n");
+            continue;
+        }
+        memcpy(temp_image.virt_addr, rgb_frame.data, temp_image.size);
+    #endif
+
+        // 上锁，更新全局 src_image
+        pthread_mutex_lock(&src_image_mutex);
+
+        // 释放旧的 src_image 内存，防止泄漏
+        if (src_image.virt_addr != NULL) {
+        #if defined(RV1106_1103)
+            dma_buf_free(src_image.size, &src_image.fd, src_image.virt_addr);
+        #else
+            free(src_image.virt_addr);
+        #endif
+            src_image.virt_addr = NULL;
+            src_image.size = 0;
+        }
+
+        // 把临时的 temp_image 复制给全局 src_image
+        memcpy(&src_image, &temp_image, sizeof(image_buffer_t));
+        pthread_mutex_unlock(&src_image_mutex);
+
+        // 如果您要释放临时资源，可以在此处理；
+        // 但由于已经把 temp_image 的指针搬到了 src_image，
+        // 这里无需再 free temp_image.virt_addr。
+        // 一般做法是“谁分配，谁释放”，所以可以直接把 temp_image 交给 src_image。
+    }
+
+    return NULL;
+}
+
+/*-------------------------------------------
+    排序比较函数（cls_id升序，prop降序）
+-------------------------------------------*/
+int compare_detect_results(const void *a, const void *b)
+{
+    const object_detect_result *res_a = (const object_detect_result *)a;
+    const object_detect_result *res_b = (const object_detect_result *)b;
+
+    if (res_a->cls_id < res_b->cls_id)
+        return -1;
+    else if (res_a->cls_id > res_b->cls_id)
+        return 1;
+    else
+    {
+        // 同类按 prop 倒序
+        if (res_a->prop > res_b->prop)
+            return -1;
+        else if (res_a->prop < res_b->prop)
+            return 1;
+        else
+            return 0;
+    }
+}
+
+/*-------------------------------------------
+               主函数入口
+-------------------------------------------*/
+int main(int argc, char **argv)
+{
+
+    const char *model_path = "model/tracker.rknn";
+
+    // 创建摄像头读取线程
+    pthread_t camera_thread;
+    int thread_ret = pthread_create(&camera_thread, NULL, camera_thread_func, NULL);
+    if (thread_ret != 0)
+    {
+        printf("无法创建摄像头线程！返回值=%d\n", thread_ret);
+        return -1;
+    }
+
+    // 提前声明一些检测用的变量
+    object_detect_result left_eyes[2];
+    int left_eye_count = 0;
+    object_detect_result right_eyes[2];
+    int right_eye_count = 0;
+    object_detect_result pupils[2];
+    int pupil_count = 0;
+    object_detect_result irises[2];
+    int iris_count = 0;
+
+    // 初始化后处理
+    init_post_process();
+
+    // 加载 YOLOv5 模型
+    int ret;
+    rknn_app_context_t rknn_app_ctx;
+    memset(&rknn_app_ctx, 0, sizeof(rknn_app_context_t));
+
+    ret = init_yolov5_model(model_path, &rknn_app_ctx);
+    if (ret != 0)
+    {
+        printf("加载YOLOv5模型失败！返回值=%d，模型路径=%s\n", ret, model_path);
+        goto out;
+    }
+
+    // 清空全局 src_image
+    memset(&src_image, 0, sizeof(image_buffer_t));
+
+    // 主循环：持续处理最新帧
+    while (1)
+    {
+        // 加锁读取全局 src_image
+        pthread_mutex_lock(&src_image_mutex);
+        if (src_image.virt_addr == NULL)
+        {
+            // 如果还没捕获到有效帧，就稍等一下
+            pthread_mutex_unlock(&src_image_mutex);
+            usleep(1000);
+            continue;
+        }
+
+        // 将 src_image 拷贝一份到 current_image 进行处理
+        image_buffer_t current_image;
+        memcpy(&current_image, &src_image, sizeof(image_buffer_t));
+        pthread_mutex_unlock(&src_image_mutex);
+
+        // 推理 YOLOv5
+        object_detect_result_list od_results;
+        od_results.count = 0; // 清零
+        ret = inference_yolov5_model(&rknn_app_ctx, &current_image, &od_results);
+        if (ret != 0)
+        {
+            printf("YOLOv5推理失败！返回值=%d\n", ret);
+
+            // 处理完后释放 current_image 内存
+        #if defined(RV1106_1103)
+            dma_buf_free(current_image.size, &current_image.fd, current_image.virt_addr);
+        #else
+            free(current_image.virt_addr);
+        #endif
+            continue;
+        }
+
+        // 简单过滤：每个cls_id保留置信度最高的一条
+        if (od_results.count > 0)
+        {
+            // 按 cls_id 升序 + prop 降序 排序
+            qsort(od_results.results, od_results.count, sizeof(object_detect_result), compare_detect_results);
+
+            // 创建新的过滤结果
+            object_detect_result_list filtered_od_results;
+            filtered_od_results.count = 0;
+
+            int cls_counts[100];
+            memset(cls_counts, 0, sizeof(cls_counts));
+
+            for (int i = 0; i < od_results.count; i++)
+            {
+                int cls_id = od_results.results[i].cls_id;
+                if (cls_id < 0 || cls_id >= 100)
+                    continue;
+
+                if (cls_counts[cls_id] < 1) // 每个cls_id仅保留一个
+                {
+                    filtered_od_results.results[filtered_od_results.count++] = od_results.results[i];
+                    cls_counts[cls_id]++;
+                }
+            }
+            // 把过滤结果替换
+            od_results = filtered_od_results;
+        }
+
+        // 对 pupil / iris 做相对位置处理
+        int pupil_assigned[10];
+        int iris_assigned[10];
+        memset(pupil_assigned, 0, sizeof(pupil_assigned));
+        memset(iris_assigned, 0, sizeof(iris_assigned));
+
+        // 先将目标分别归类
+        left_eye_count = 0;
+        right_eye_count = 0;
+        pupil_count = 0;
+        iris_count = 0;
+        for (int i = 0; i < od_results.count; i++)
+        {
+            object_detect_result *det = &od_results.results[i];
+            const char *cls_name = coco_cls_to_name(det->cls_id);
+
+            if (strcmp(cls_name, "left") == 0)
+            {
+                if (left_eye_count < 2)
+                    left_eyes[left_eye_count++] = *det;
+            }
+            else if (strcmp(cls_name, "right") == 0)
+            {
+                if (right_eye_count < 2)
+                    right_eyes[right_eye_count++] = *det;
+            }
+            else if (strcmp(cls_name, "pupil") == 0)
+            {
+                if (pupil_count < 2)
+                    pupils[pupil_count++] = *det;
+            }
+            else if (strcmp(cls_name, "iris") == 0)
+            {
+                if (iris_count < 2)
+                    irises[iris_count++] = *det;
+            }
+        }
+
+        // 如果有检测到眼睛、瞳孔、虹膜
+        if ((left_eye_count > 0 || right_eye_count > 0) && pupil_count > 0 && iris_count > 0)
+        {
+            // 处理左眼
+            for (int e = 0; e < left_eye_count; e++)
+            {
+                object_detect_result *eye = &left_eyes[e];
+                object_detect_result* matched_pupil = NULL;
+                object_detect_result* matched_iris  = NULL;
+
+                // 找瞳孔
+                for (int p = 0; p < pupil_count; p++)
+                {
+                    if (pupil_assigned[p]) continue;
+                    object_detect_result *pupil = &pupils[p];
+
+                    // 判断 pupil 是否在 eye 框内
+                    if (pupil->box.left >= eye->box.left &&
+                        pupil->box.right <= eye->box.right &&
+                        pupil->box.top >= eye->box.top &&
+                        pupil->box.bottom <= eye->box.bottom)
+                    {
+                        matched_pupil = pupil;
+                        pupil_assigned[p] = 1; 
+                        break;
+                    }
+                }
+                // 找虹膜
+                for (int i_idx = 0; i_idx < iris_count; i_idx++)
+                {
+                    if (iris_assigned[i_idx]) continue;
+                    object_detect_result *iris = &irises[i_idx];
+                    if (iris->box.left >= eye->box.left &&
+                        iris->box.right <= eye->box.right &&
+                        iris->box.top >= eye->box.top &&
+                        iris->box.bottom <= eye->box.bottom)
+                    {
+                        matched_iris = iris;
+                        iris_assigned[i_idx] = 1;
+                        break;
+                    }
+                }
+
+                // 两者都找到，进行计算
+                if (matched_pupil && matched_iris)
+                    calculate_and_print_position(*eye, *matched_pupil, *matched_iris);
+            }
+
+            // 处理右眼
+            for (int e = 0; e < right_eye_count; e++)
+            {
+                object_detect_result *eye = &right_eyes[e];
+                object_detect_result* matched_pupil = NULL;
+                object_detect_result* matched_iris  = NULL;
+
+                // 瞳孔
+                for (int p = 0; p < pupil_count; p++)
+                {
+                    if (pupil_assigned[p]) continue;
+                    object_detect_result *pupil = &pupils[p];
+                    if (pupil->box.left >= eye->box.left &&
+                        pupil->box.right <= eye->box.right &&
+                        pupil->box.top >= eye->box.top &&
+                        pupil->box.bottom <= eye->box.bottom)
+                    {
+                        matched_pupil = pupil;
+                        pupil_assigned[p] = 1; 
+                        break;
+                    }
+                }
+                // 虹膜
+                for (int i_idx = 0; i_idx < iris_count; i_idx++)
+                {
+                    if (iris_assigned[i_idx]) continue;
+                    object_detect_result *iris = &irises[i_idx];
+                    if (iris->box.left >= eye->box.left &&
+                        iris->box.right <= eye->box.right &&
+                        iris->box.top >= eye->box.top &&
+                        iris->box.bottom <= eye->box.bottom)
+                    {
+                        matched_iris = iris;
+                        iris_assigned[i_idx] = 1;
+                        break;
+                    }
+                }
+
+                if (matched_pupil && matched_iris)
+                    calculate_and_print_position(*eye, *matched_pupil, *matched_iris);
+            }
+        }
+
+        // (可选) 打印检测结果，并做一些绘制 / 可视化
+        // 因为 current_image 是RGB888 数据，如果想画框+文字，需要先转回 cv::Mat 再绘制
+        // 或者使用 draw_rectangle / draw_text (image_drawing.h)
+
+        for (int i = 0; i < od_results.count; i++)
+        {
+            object_detect_result *det = &od_results.results[i];
+            printf("%s @ (%d %d %d %d) prop=%.3f\n",
+                   coco_cls_to_name(det->cls_id),
+                   det->box.left,
+                   det->box.top,
+                   det->box.right,
+                   det->box.bottom,
+                   det->prop);
+        }
+
+        // 释放 current_image
+    #if defined(RV1106_1103)
+        dma_buf_free(current_image.size, &current_image.fd, current_image.virt_addr);
+    #else
+        free(current_image.virt_addr);
+    #endif
+
+        // 等待一小段时间，避免疯狂占用CPU
+        usleep(1000);
+    } // end while(1)
+
+out:
+    // 清理后处理
+    deinit_post_process();
+
+    // 释放YOLOv5模型
+    ret = release_yolov5_model(&rknn_app_ctx);
+    if (ret != 0)
+    {
+        printf("释放YOLOv5模型资源失败！返回值=%d\n", ret);
+    }
+
+    // 释放全局 src_image
+    if (src_image.virt_addr != NULL)
+    {
+    #if defined(RV1106_1103)
+        dma_buf_free(src_image.size, &src_image.fd, src_image.virt_addr);
+    #else
+        free(src_image.virt_addr);
+    #endif
+    }
+
+    // 等待摄像头线程结束（正常不会结束）
+    pthread_join(camera_thread, NULL);
+
+    return 0;
+}
