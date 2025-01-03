@@ -8,6 +8,9 @@
 #include <pthread.h>
 #include <unistd.h>
 #include <time.h>
+#include <fcntl.h>
+#include <termios.h>
+#include <nlohmann/json.hpp>
 #include <opencv2/core/core.hpp>
 #include <opencv2/highgui/highgui.hpp>
 #include <opencv2/imgproc/imgproc.hpp>
@@ -23,6 +26,10 @@
 
 #define MAX_ITEM 1
 
+using json = nlohmann::json;
+
+
+
 /*-------------------------------------------
     全局变量 & 同步
 -------------------------------------------*/
@@ -35,6 +42,8 @@ int no_detection_count = 0;
 float last_norm_x = 0.0f;
 float last_norm_y = 0.0f;
 const int MAX_NO_DETECTION = 100;
+json result_json;
+char serial_port[15] = "/dev/ttyS3";
 
 /*-------------------------------------------
     初始化卡尔曼滤波器
@@ -168,6 +177,7 @@ int compare_detect_results(const void *a, const void *b)
     return 0;
 }
 
+
 /*-------------------------------------------
                 主函数
 -------------------------------------------*/
@@ -216,6 +226,37 @@ int main(int argc, char **argv)
         goto out;
     }
     printf("模型加载成功\n");
+
+    //启动串口进程
+    int serial_fd;
+    serial_fd = open(serial_port, O_RDWR | O_NOCTTY);
+    if (serial_fd == -1) {
+        perror("Failed to open serial port");
+        return 1;
+    }
+    struct termios tty;
+    memset(&tty, 0, sizeof(tty));
+
+    if (tcgetattr(serial_fd, &tty) != 0) {
+        perror("Error from tcgetattr");
+        return 1;
+    }
+
+    cfsetospeed(&tty, B1152000);
+    cfsetispeed(&tty, B1152000);
+
+    tty.c_cflag &= ~PARENB;
+    tty.c_cflag &= ~CSTOPB;
+    tty.c_cflag &= ~CSIZE;
+    tty.c_cflag |= CS8;
+
+    tty.c_cc[VTIME] = 1;                // 超时时间0.1秒
+    tty.c_cc[VMIN] = 0;                 // 不等待字符
+
+    if (tcsetattr(serial_fd, TCSANOW, &tty) != 0) {
+        perror("Error from tcsetattr");
+        return 1;
+    }
 
     printf("开始主循环处理...\n");
     // 主循环
@@ -301,11 +342,16 @@ int main(int argc, char **argv)
             float velocity_x = estimated.at<float>(2);
             float velocity_y = estimated.at<float>(3);
 
-            printf("no detection[%d]: raw=(%.3f,%.3f) filtered=(%.3f,%.3f) vel=(%.3f,%.3f)\n",
-                no_detection_count,
-                measurement.at<float>(0), measurement.at<float>(1),
-                filtered_x, filtered_y,
-                velocity_x, velocity_y);
+            // 存储到json
+            result_json["stat"] = "no";
+            result_json["raw"] = {
+                {"x", measurement.at<float>(0)},
+                {"y", measurement.at<float>(1)}
+            };
+            result_json["fl"] = {
+                {"x", filtered_x},
+                {"y", filtered_y}
+            };
         }
 
         for (int i = 0; i < od_results.count; i++)
@@ -348,25 +394,51 @@ int main(int argc, char **argv)
             float filtered_y = estimated.at<float>(1);
             float velocity_x = estimated.at<float>(2);
             float velocity_y = estimated.at<float>(3);
+            // 计算框的宽高
+            int box_width = det_result->box.right - det_result->box.left;
+            int box_height = det_result->box.bottom - det_result->box.top;
 
-            printf("person %d: box=(%d,%d,%d,%d) raw=(%.3f,%.3f) filtered=(%.3f,%.3f) vel=(%.3f,%.3f) conf=%.3f\n",
-                i,
-                det_result->box.left, det_result->box.top,
-                det_result->box.right, det_result->box.bottom,
-                norm_x, norm_y,
-                filtered_x, filtered_y,
-                velocity_x, velocity_y,
-                det_result->prop);
+
+            // 存储到json
+            result_json["stat"] = "yes";
+            result_json["info"] = {
+                {"box", {
+                    {"w", box_width},
+                    {"h", box_height}
+                }},
+                {"c", det_result->prop}
+            };
+            result_json["raw"] = {
+                {"x", norm_x},
+                {"y", norm_y}
+            };
+            result_json["fl"] = {
+                {"x", filtered_x},
+                {"y", filtered_y}
+            };
+ 
+            
         }
+        // 序列化为字符串并输出
+            std::string json_str = result_json.dump();
 
+            json_str += "\n";  // 添加换行符作为消息结束标记
 
+            // 直接写入字符串，不需要额外的缓冲区
+            ssize_t bytes_written = write(serial_fd, json_str.c_str(), json_str.length());
+            if (bytes_written < 0) {
+                perror("Error writing to serial port");
+                close(serial_fd);
+                return 1;
+            }
+            // printf("%s\n", json_str.c_str());
     }
 
 out:
     printf("清理资源...\n");
     g_camera_running = false;
     deinit_post_process();
-
+    close(serial_fd);
     ret = release_yolov5_model(&rknn_app_ctx);
     if (ret != 0) {
         printf("释放YOLOv5模型资源失败！返回值=%d\n", ret);

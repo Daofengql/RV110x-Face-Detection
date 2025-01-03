@@ -9,6 +9,7 @@ set(rknpu_yolov5_file rknpu2/yolov5.cc)
 
 
 
+
 if (TARGET_SOC STREQUAL "rv1106" OR TARGET_SOC STREQUAL "rv1103")
     add_definitions(-DRV1106_1103)
     set(rknpu_yolov5_file rknpu2/yolov5_rv1106_1103.cc)
@@ -22,6 +23,7 @@ elseif(TARGET_SOC STREQUAL "rk1808" OR TARGET_SOC STREQUAL "rv1109" OR TARGET_SO
     set(rknpu_yolov5_file rknpu1/yolov5.cc)
 endif()
 
+include_directories(${CMAKE_CURRENT_SOURCE_DIR}/../3rdparty)
 # 与 3rdparty、utils 同级，都在 src 下
 add_subdirectory(${CMAKE_CURRENT_SOURCE_DIR}/../3rdparty 3rdparty.out)
 add_subdirectory(${CMAKE_CURRENT_SOURCE_DIR}/../utils     utils.out)
