@@ -177,6 +177,11 @@ int compare_detect_results(const void *a, const void *b)
     return 0;
 }
 
+std::string format_float(float value, int precision = 3) {
+    char buffer[32];
+    snprintf(buffer, sizeof(buffer), "%.*f", precision, value);
+    return std::string(buffer);
+}
 
 /*-------------------------------------------
                 主函数
@@ -187,8 +192,6 @@ int main(int argc, char **argv)
     
     const char *model_path = "./model/tracker.rknn";
     int ret;
-
-    system("RkLunch-stop.sh");  // 停止RockChip的启动服务，以便使用摄像头
 
     // 初始化卡尔曼滤波器
     init_kalman_filter();
@@ -345,12 +348,12 @@ int main(int argc, char **argv)
             // 存储到json
             result_json["stat"] = "no";
             result_json["raw"] = {
-                {"x", measurement.at<float>(0)},
-                {"y", measurement.at<float>(1)}
+                {"x", format_float(measurement.at<float>(0))},
+                {"y", format_float(measurement.at<float>(1))}
             };
             result_json["fl"] = {
-                {"x", filtered_x},
-                {"y", filtered_y}
+                {"x", format_float(filtered_x)},
+                {"y", format_float(filtered_y)}
             };
         }
 
@@ -406,15 +409,15 @@ int main(int argc, char **argv)
                     {"w", box_width},
                     {"h", box_height}
                 }},
-                {"c", det_result->prop}
+                {"c", format_float(det_result->prop)}
             };
             result_json["raw"] = {
-                {"x", norm_x},
-                {"y", norm_y}
+                {"x", format_float(norm_x)},
+                {"y", format_float(norm_y)}
             };
             result_json["fl"] = {
-                {"x", filtered_x},
-                {"y", filtered_y}
+                {"x", format_float(filtered_x)},
+                {"y", format_float(filtered_y)}
             };
  
             
