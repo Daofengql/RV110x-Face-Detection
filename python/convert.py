@@ -44,7 +44,8 @@ if __name__ == '__main__':
     # Pre-process config
     print('--> Config model')
     rknn.config(mean_values=[[0, 0, 0]], std_values=[
-                    [255, 255, 255]], target_platform=platform)
+                    [255, 255, 255]], target_platform=platform,
+                    quantized_algorithm="mmse")
     print('done')
 
     # Load model
